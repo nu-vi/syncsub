@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+
+VERSION = "1.0.0"
+
+import re, sys, pathlib, shutil
+
+USAGE = """syncsub - retime drifting .srt subtitles using two sync points
+
+Usage:
+  syncsub SUBFILE V1 S1 V2 S2
+  syncsub -h
+  syncsub --help
+  syncsubs -v
+  syncsubs --version
+
+Arguments:
+  SUBFILE   Path to the .srt file you want to fix.
+            The file will be modified in-place, and a backup SUBFILE.bak
+            will be created first.
+
+  V1        Correct (video) timestamp for an early line.
+            Example: 00:01:14,777
+            This is when the line is actually spoken in the movie.
+
+  S1        Current (subtitle) timestamp for that same early line
+            as it appears in the .srt before fixing.
+            Example: 00:00:58,777
+
+  V2        Correct (video) timestamp for a late line (near the end).
+            Example: 01:25:30,500
+
+  S2        Current (subtitle) timestamp for that late line
+            as it appears in the .srt before fixing.
+            Example: 01:25:20,214
+
+What it does:
+  We assume timing drift is linear (same movie cut, just offset/speed off).
+  We solve a linear transform:
+
+      new_time = A + B * old_time
+
+  using the two known sync pairs:
+      S1 -> V1
+      S2 -> V2
+
+  Then we rewrite every timestamp in the .srt with that formula.
+
+Examples:
+  syncsubs "/path/movie.srt" \
+           00:01:14,777 00:00:58,777 \
+           01:25:30,500 01:25:20,214
+"""
+
+TS_RE = re.compile(r'(\d{2}):(\d{2}):(\d{2})[.,](\d{3})')
+
+def show_help(exitcode=0):
+    print(USAGE)
+    sys.exit(exitcode)
+
+def show_version():
+    print(f"syncsubs {VERSION}")
+    sys.exit(0)
+
+def parse_timestamp(ts_str):
+    """
+    Accepts "HH:MM:SS,ms" or "HH:MM:SS.ms"
+    Also accepts single-digit hour like "1:25:30,500"
+    Returns float seconds.
+    """
+    ts_str = ts_str.strip()
+    # normalise comma -> dot so we only handle "."
+    parts = ts_str.replace(',', '.').split(':')
+    if len(parts) != 3:
+        sys.exit(f"Bad timestamp '{ts_str}': must look like HH:MM:SS,mmm")
+
+    h_str, m_str, s_ms_str = parts
+
+    if '.' in s_ms_str:
+        s_str, ms_str = s_ms_str.split('.', 1)
+    else:
+        s_str, ms_str = s_ms_str, "000"
+
+    # pad/trim ms to 3 digits
+    ms_str = (ms_str + "000")[0:3]
+
+    try:
+        h = int(h_str)
+        m = int(m_str)
+        s = int(s_str)
+        ms = int(ms_str)
+    except ValueError:
+        sys.exit(f"Bad timestamp '{ts_str}': can't parse numbers")
+
+    return h*3600 + m*60 + s + ms/1000.0
+
+def seconds_to_srt(ts_seconds):
+    # clamp <0 to 0
+    if ts_seconds < 0:
+        ts_seconds = 0.0
+
+    total_ms = int(round(ts_seconds * 1000))
+
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+
+    s = total_s % 60
+    total_m = total_s // 60
+
+    m = total_m % 60
+    h = total_m // 60
+
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def compute_transform(V1, S1, V2, S2):
+    """
+    Solve A and B in:
+        new_time = A + B * old_time
+
+    using:
+        S1 -> V1
+        S2 -> V2
+    """
+    denom = (S2 - S1)
+    if abs(denom) < 1e-9:
+        sys.exit("Error: S2 and S1 are the same time, can't compute scale.")
+    B = (V2 - V1) / denom
+    A = V1 - B * S1
+    return A, B
+
+def main():
+    # --help / -h handling / -v / --version
+    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+        show_help(0)
+    if len(sys.argv) == 2 and sys.argv[1] in ("-v", "--version"):
+        show_version()
+
+    # normal mode: need exactly 5 args after script name
+    if len(sys.argv) != 6:
+        # bad usage
+        show_help(1)
+
+    sub_path_str, V1_str, S1_str, V2_str, S2_str = sys.argv[1:]
+
+    sub_path = pathlib.Path(sub_path_str)
+    if not sub_path.exists():
+        sys.exit(f"Subtitle file not found: {sub_path}")
+
+    # parse input timestamps
+    V1 = parse_timestamp(V1_str)
+    S1 = parse_timestamp(S1_str)
+    V2 = parse_timestamp(V2_str)
+    S2 = parse_timestamp(S2_str)
+
+    # compute linear mapping
+    A, B = compute_transform(V1, S1, V2, S2)
+
+    # read file
+    original_text = sub_path.read_text(encoding="utf-8", errors="replace")
+
+    def fix_match(m):
+        h, mm, s, ms = m.groups()
+        old_sec = int(h)*3600 + int(mm)*60 + int(s) + int(ms)/1000.0
+        new_sec = A + B * old_sec
+        return seconds_to_srt(new_sec)
+
+    fixed_text = TS_RE.sub(fix_match, original_text)
+
+    # backup original
+    backup_path = sub_path.with_suffix(sub_path.suffix + ".bak")
+    shutil.copy2(sub_path, backup_path)
+
+    # write new version
+    sub_path.write_text(fixed_text, encoding="utf-8")
+
+    print("Sync complete.")
+    print(f"A = {A}")
+    print(f"B = {B}")
+    print(f"Updated file : {sub_path}")
+    print(f"Backup saved : {backup_path}")
+
+if __name__ == "__main__":
+    main()
+
